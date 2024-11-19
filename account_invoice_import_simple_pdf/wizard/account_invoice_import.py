@@ -21,10 +21,6 @@ try:
 except ImportError:
     logger.debug("Cannot import regex")
 try:
-    import pdfplumber
-except ImportError:
-    logger.debug("Cannot import pdfplumber")
-try:
     import pdftotext
 except ImportError:
     logger.debug("Cannot import pdftotext")
@@ -50,10 +46,12 @@ class AccountInvoiceImport(models.TransientModel):
     @api.model
     def _simple_pdf_text_extraction_pymupdf(self, fileobj, test_info):
         res = False
+        version = None
         try:
             pages = []
             doc = fitz.open(fileobj.name)
             for page in doc:
+                # pages.append(page.get_text())
                 # Check if Tessdata is available for OCR
                 tessdata = fitz.get_tessdata()
                 # Perform OCR if Tessdata is available, otherwise use regular text extraction
@@ -68,44 +66,34 @@ class AccountInvoiceImport(models.TransientModel):
                 "all": "\n\n".join(pages),
                 "first": pages and pages[0] or "",
             }
-            logger.info("Text extraction made with PyMuPDF %s", fitz.__version__)
-            test_info["text_extraction"] = "pymupdf %s" % fitz.__version__
+            # For PyMuPDF, we used to get the version via __version__
+            # but it is not possible with newer version of the lib
+            if hasattr(fitz, "__version__"):
+                version = fitz.__version__
+            elif hasattr(fitz, "version") and isinstance(fitz.version, tuple):
+                version = fitz.version[0]
+            logger.info("Text extraction made with PyMuPDF %s", version)
+            test_info["text_extraction"] = "pymupdf %s" % version
         except Exception as e:
             logger.warning("Text extraction with PyMuPDF failed. Error: %s", e)
         return res
 
     @api.model
-    def _simple_pdf_text_extraction_pdfplumber(self, fileobj, test_info):
-        res = False
-        with pdfplumber.open(fileobj.name, laparams={"detect_vertical": True}) as pdf:
-            pages = []
-            for pdf_page in pdf.pages:
-                pages.append(
-                    pdf_page.extract_text(
-                        layout=True, use_text_flow=True, keep_blank_chars=True
-                    )
-                )
-            res = {
-                "all": "\n\n".join(pages),
-                "first": pages and pages[0] or "",
-            }
-        test_info["text_extraction"] = "pdfplumber %s" % pdfplumber.__version__
-        logger.info("Text extraction made with pdfplumber %s", pdfplumber.__version__)
-        return res
-
-    @api.model
     def _simple_pdf_text_extraction_pypdf(self, fileobj, test_info):
         res = False
-        reader = pypdf.PdfReader(fileobj.name)
-        pages = []
-        for pdf_page in reader.pages:
-            pages.append(pdf_page.extract_text())
-            res = {
-                "all": "\n\n".join(pages),
-                "first": pages and pages[0] or "",
-            }
-        test_info["text_extraction"] = "pypdf %s" % pypdf.__version__
-        logger.info("Text extraction made with pypdf %s", pypdf.__version__)
+        try:
+            reader = pypdf.PdfReader(fileobj.name)
+            pages = []
+            for pdf_page in reader.pages:
+                pages.append(pdf_page.extract_text())
+                res = {
+                    "all": "\n\n".join(pages),
+                    "first": pages and pages[0] or "",
+                }
+            test_info["text_extraction"] = "pypdf %s" % pypdf.__version__
+            logger.info("Text extraction made with pypdf %s", pypdf.__version__)
+        except Exception as e:
+            logger.warning("Text extraction with pypdf failed. Error: %s", e)
         return res
 
     @api.model
@@ -173,8 +161,6 @@ class AccountInvoiceImport(models.TransientModel):
             res = self._simple_pdf_text_extraction_pdftotext_lib(fileobj, test_info)
         elif specific_tool == "pdftotext.cmd":
             res = self._simple_pdf_text_extraction_pdftotext_cmd(fileobj, test_info)
-        elif specific_tool == "pdfplumber":
-            res = self._simple_pdf_text_extraction_pdfplumber(fileobj, test_info)
         elif specific_tool == "pypdf":
             res = self._simple_pdf_text_extraction_pypdf(fileobj, test_info)
         else:
@@ -198,12 +184,6 @@ class AccountInvoiceImport(models.TransientModel):
 
     @api.model
     def simple_pdf_text_extraction(self, file_data, test_info):
-        fileobj = NamedTemporaryFile("wb", prefix="odoo-simple-pdf-", suffix=".pdf")
-        fileobj.write(file_data)
-        # Extract text from PDF
-        # Very interesting reading:
-        # https://dida.do/blog/how-to-extract-text-from-pdf
-        # https://github.com/erfelipe/PDFtextExtraction
         specific_tool = (
             self.env["ir.config_parameter"]
             .sudo()
@@ -212,29 +192,41 @@ class AccountInvoiceImport(models.TransientModel):
         if specific_tool:
             specific_tool = specific_tool.strip().lower()
         test_info["text_extraction_config"] = specific_tool
-        if specific_tool:
-            res = self._simple_pdf_text_extraction_specific_tool(
-                specific_tool, fileobj, test_info
-            )
-        else:
-            # From best tool to worst
-            res = self._simple_pdf_text_extraction_pymupdf(fileobj, test_info)
-            if not res:
-                res = self._simple_pdf_text_extraction_pdftotext_lib(fileobj, test_info)
-            if not res:
-                res = self._simple_pdf_text_extraction_pdftotext_cmd(fileobj, test_info)
-            if not res:
-                res = self._simple_pdf_text_extraction_pdfplumber(fileobj, test_info)
-            if not res:
-                res = self._simple_pdf_text_extraction_pypdf(fileobj, test_info)
-            if not res:
-                raise UserError(
-                    _(
-                        "Odoo could not extract the text from the PDF invoice. "
-                        "Refer to the Odoo server logs for more technical information "
-                        "about the cause of the failure."
-                    )
+
+        with NamedTemporaryFile(
+            "wb", prefix="odoo-simple-pdf-", suffix=".pdf"
+        ) as fileobj:
+            fileobj.write(file_data)
+            fileobj.seek(0)
+            # Extract text from PDF
+            # Very interesting reading:
+            # https://dida.do/blog/how-to-extract-text-from-pdf
+            # https://github.com/erfelipe/PDFtextExtraction
+            if specific_tool:
+                res = self._simple_pdf_text_extraction_specific_tool(
+                    specific_tool, fileobj, test_info
                 )
+            else:
+                # From best tool to worst
+                res = self._simple_pdf_text_extraction_pymupdf(fileobj, test_info)
+                if not res:
+                    res = self._simple_pdf_text_extraction_pdftotext_lib(
+                        fileobj, test_info
+                    )
+                if not res:
+                    res = self._simple_pdf_text_extraction_pdftotext_cmd(
+                        fileobj, test_info
+                    )
+                if not res:
+                    res = self._simple_pdf_text_extraction_pypdf(fileobj, test_info)
+                if not res:
+                    raise UserError(
+                        _(
+                            "Odoo could not extract the text from the PDF invoice. "
+                            "Refer to the Odoo server logs for more technical information "
+                            "about the cause of the failure."
+                        )
+                    )
         for key, text in res.items():
             if text:
                 # Remove lonely accents
@@ -249,7 +241,6 @@ class AccountInvoiceImport(models.TransientModel):
         res["first_no_space"] = regex.sub(
             "%s+" % test_info["space_pattern"], "", res["first"]
         )
-        fileobj.close()
         return res
 
     @api.model
